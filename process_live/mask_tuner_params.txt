@@ -1,0 +1,1 @@
+--red-h1-max 12 --red-h2-min 168 --red-s-min 160 --red-v-min 100 --blue-h-min 108 --blue-h-max 129 --blue-s-min 145 --blue-v-min 41 --clahe
