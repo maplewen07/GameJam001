@@ -1,0 +1,12 @@
+.venv/
+.venv-build/
+.DS_Store
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+recordings/*.mp4
+recordings/*.log
+*/recordings/*.mp4
+*/recordings/*.log

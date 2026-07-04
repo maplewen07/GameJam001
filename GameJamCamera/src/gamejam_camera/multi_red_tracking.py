@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import json
 import math
+import threading
 import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
 
+from . import config as app_config
+from . import live_camera as live
 
-ROOT = Path(__file__).resolve().parents[1]
-LIVE_PATH = ROOT / "process_live" / "live_camera_720_clahe.py"
-
-spec = importlib.util.spec_from_file_location("live", LIVE_PATH)
-live = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(live)
 
 cv2 = live.cv2
 np = live.np
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class HeadlessPreview:
@@ -25,6 +26,135 @@ class HeadlessPreview:
 
     def close(self) -> None:
         pass
+
+
+class PersonFrameStore:
+    def __init__(self, history_limit: int) -> None:
+        self.lock = threading.Lock()
+        self.latest: dict[str, object] | None = None
+        self.history: deque[dict[str, object]] = deque(maxlen=max(1, int(history_limit)))
+
+    def update(self, payload: dict[str, object]) -> None:
+        with self.lock:
+            self.latest = payload
+            self.history.append(payload)
+
+    def latest_payload(self) -> dict[str, object] | None:
+        with self.lock:
+            return self.latest
+
+    def history_payloads(self, limit: int | None = None) -> list[dict[str, object]]:
+        with self.lock:
+            rows = list(self.history)
+        if limit is None:
+            return rows
+        return rows[-max(0, limit) :]
+
+
+class PersonFrameHttpServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, address: tuple[str, int], store: PersonFrameStore) -> None:
+        super().__init__(address, PersonFrameRequestHandler)
+        self.store = store
+
+
+class PersonFrameRequestHandler(BaseHTTPRequestHandler):
+    server: PersonFrameHttpServer
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_cors_headers()
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/health"):
+            latest = self.server.store.latest_payload()
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "latest_frame": latest.get("frame") if latest else None,
+                    "people": len(latest.get("people", [])) if latest else 0,
+                    "endpoints": [
+                        "/person-frame/latest",
+                        "/person-frame/history?limit=60",
+                    ],
+                },
+            )
+            return
+
+        if parsed.path in ("/latest", "/person-frame", "/person-frame/latest"):
+            latest = self.server.store.latest_payload()
+            if latest is None:
+                self.send_json(404, {"ok": False, "error": "no person frame available yet"})
+                return
+            self.send_json(200, latest)
+            return
+
+        if parsed.path in ("/history", "/person-frame/history"):
+            query = parse_qs(parsed.query)
+            limit = parse_positive_int(query.get("limit", ["60"])[0], 60)
+            self.send_json(200, {"frames": self.server.store.history_payloads(limit)})
+            return
+
+        self.send_json(404, {"ok": False, "error": "not found"})
+
+    def send_json(self, status: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_cors_headers(self) -> None:
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def log_message(self, _format: str, *_args: Any) -> None:
+        return
+
+
+class PersonFrameSocketService:
+    def __init__(self, host: str, port: int, history_limit: int) -> None:
+        self.host = host
+        self.port = int(port)
+        self.store = PersonFrameStore(history_limit)
+        self.server: PersonFrameHttpServer | None = None
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.server = PersonFrameHttpServer((self.host, self.port), self.store)
+        self.host, self.port = self.server.server_address[:2]
+        self.thread = threading.Thread(target=self.server.serve_forever, name="person-frame-socket", daemon=True)
+        self.thread.start()
+        print(f"person_socket=http://{self.host}:{self.port}/person-frame/latest")
+
+    def update(self, payload: dict[str, object]) -> None:
+        self.store.update(payload)
+
+    def close(self) -> None:
+        if self.server is None:
+            return
+        self.server.shutdown()
+        self.server.server_close()
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+        self.server = None
+        self.thread = None
+
+
+def parse_positive_int(value: object, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
 
 
 def red_candidates_and_mask(
@@ -44,11 +174,6 @@ def red_candidates_and_mask(
     return rows, red
 
 
-def red_candidates(frame: np.ndarray, cal: dict[str, object], args: argparse.Namespace) -> list[dict[str, object]]:
-    rows, _ = red_candidates_and_mask(frame, cal, args)
-    return rows
-
-
 def foot_split_y(cal: dict[str, object], args: argparse.Namespace) -> float:
     blue = cal["blue"]
     back_y = (float(blue["back_left"]["cy"]) + float(blue["back_right"]["cy"])) * 0.5
@@ -56,40 +181,9 @@ def foot_split_y(cal: dict[str, object], args: argparse.Namespace) -> float:
 
 
 def split_markers(markers: list[dict[str, object]], split_y: float) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    # ponytail: one global screen-space line is enough for this camera setup.
     heads = [m for m in markers if float(m["cy"]) < split_y]
     feet = [m for m in markers if float(m["cy"]) >= split_y]
     return heads, feet
-
-
-def pair_people(markers: list[dict[str, object]], args: argparse.Namespace, split_y: float) -> list[dict[str, object]]:
-    heads, feet = split_markers(markers, split_y)
-    people = []
-    used_feet: set[int] = set()
-    for head in sorted(heads, key=lambda m: float(m["cy"])):
-        choices = []
-        for i, foot in enumerate(feet):
-            if i in used_feet:
-                continue
-            if float(foot["cy"]) <= float(head["cy"]):
-                continue
-            dist = math.hypot(float(head["cx"]) - float(foot["cx"]), float(head["cy"]) - float(foot["cy"]))
-            choices.append((dist, i, foot))
-        if not choices:
-            continue
-        dist, i, foot = min(choices, key=lambda item: item[0])
-        if dist > args.pair_max_px:
-            continue
-        used_feet.add(i)
-        people.append(
-            {
-                "head": head,
-                "foot": foot,
-                "center": (float(foot["cx"]), float(foot["cy"])),
-                "pair_distance": dist,
-            }
-        )
-    return people
 
 
 def init_person_detections(markers: list[dict[str, object]], args: argparse.Namespace, split_y: float) -> list[dict[str, object]]:
@@ -121,7 +215,6 @@ def merge_init_feet(feet: list[dict[str, object]], args: argparse.Namespace) -> 
             clusters[-1].append(foot)
         else:
             clusters.append([foot])
-    # ponytail: one foot anchor per person; if a leg ring splits into two blobs, keep the lower/larger one.
     return [max(cluster, key=lambda m: (float(m["cy"]), float(m["area"]))) for cluster in clusters]
 
 
@@ -204,7 +297,6 @@ def make_person(person_id: int, track: dict[str, object], shape: tuple[int, int,
     head = median_blob(samples, "head")
     foot = median_blob(samples, "foot")
     foot_center = blob_center(foot)
-    # ponytail: foot clusters are the stable person anchors; synthesize a head seed if the hat was missing during init.
     head_center = blob_center(head) if head else (foot_center[0], max(0.0, foot_center[1] - args.person_default_height))
     return {
         "id": person_id,
@@ -346,6 +438,95 @@ def process_multi_frame(
     return draw_overlay(frame, red, markers, people, cal, split_y), f"people={active}/{len(people)} markers={len(markers)}"
 
 
+def rounded_pair(point: tuple[float, float], digits: int = 2) -> list[float]:
+    return [round(float(point[0]), digits), round(float(point[1]), digits)]
+
+
+def person_center(person: dict[str, object], role: str) -> tuple[float, float] | None:
+    center = person.get(f"{role}_center")
+    if center is not None:
+        return float(center[0]), float(center[1])
+    blob = person.get(role)
+    return blob_center(blob) if blob is not None else None
+
+
+def reference_2d(head_center: tuple[float, float], foot_center: tuple[float, float]) -> tuple[dict[str, object], float]:
+    hx, hy = head_center
+    fx, fy = foot_center
+    up_x = hx - fx
+    up_y = hy - fy
+    distance = math.hypot(up_x, up_y)
+    if distance > 1e-6:
+        up_x /= distance
+        up_y /= distance
+    else:
+        up_x, up_y = 0.0, -1.0
+    right_x, right_y = -up_y, up_x
+    return (
+        {
+            "origin": "foot",
+            "origin_px": rounded_pair(foot_center),
+            "x_axis_px_unit": rounded_pair((right_x, right_y), 4),
+            "y_axis_px_unit": rounded_pair((up_x, up_y), 4),
+        },
+        distance,
+    )
+
+
+def person_frame_payload(frame_i: int, people: list[dict[str, object]], cal: dict[str, object]) -> dict[str, object]:
+    rows = []
+    for index, person in enumerate(people):
+        head_center = person_center(person, "head")
+        foot_center = person_center(person, "foot")
+        if head_center is None or foot_center is None:
+            continue
+        plane_x, plane_y = live.stable.map_xy(cal["xy_h"], foot_center[0], foot_center[1])
+        ref, distance = reference_2d(head_center, foot_center)
+        rows.append(
+            {
+                "id": int(person.get("id", index + 1)),
+                "status": str(person.get("status", "")),
+                "plane": {
+                    "source": "foot",
+                    "x": round(float(plane_x), 2),
+                    "y": round(float(plane_y), 2),
+                },
+                "reference_2d": ref,
+                "head_px": rounded_pair(head_center),
+                "foot_px": rounded_pair(foot_center),
+                "head_to_foot_vector_px": rounded_pair((foot_center[0] - head_center[0], foot_center[1] - head_center[1])),
+                "head_to_foot_distance_px": round(distance, 2),
+                "detected": {
+                    "head": person.get("head") is not None,
+                    "foot": person.get("foot") is not None,
+                },
+            }
+        )
+    return {"frame": frame_i, "people": rows}
+
+
+def emit_person_frame_output(frame_i: int, payload: dict[str, object], args: argparse.Namespace) -> None:
+    if not args.person_frame_output:
+        return
+    interval = max(1, int(args.person_frame_output_interval))
+    if frame_i % interval:
+        return
+    print("person_frame=" + json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+def publish_person_frame(
+    frame_i: int,
+    people: list[dict[str, object]],
+    cal: dict[str, object],
+    args: argparse.Namespace,
+    socket_service: PersonFrameSocketService | None,
+) -> None:
+    payload = person_frame_payload(frame_i, people, cal)
+    if socket_service is not None:
+        socket_service.update(payload)
+    emit_person_frame_output(frame_i, payload, args)
+
+
 def draw_overlay(
     frame: np.ndarray,
     red: np.ndarray,
@@ -386,6 +567,9 @@ def draw_overlay(
             )
         if hc is not None and fc is not None:
             cv2.line(overlay, (int(hc[0]), int(hc[1])), (int(fc[0]), int(fc[1])), color, 2)
+            _, distance = reference_2d((float(hc[0]), float(hc[1])), (float(fc[0]), float(fc[1])))
+            mid = (int((float(hc[0]) + float(fc[0])) * 0.5) + 6, int((float(hc[1]) + float(fc[1])) * 0.5))
+            cv2.putText(overlay, f"{distance:.0f}px", mid, cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
         for role, blob in (("head", head), ("foot", foot)):
             if blob is None:
                 continue
@@ -423,6 +607,7 @@ def run_camera(args: argparse.Namespace) -> None:
     last_status = last
     frame_i = 0
     writer = None
+    person_socket = None
     if args.record_video:
         args.record_dir.mkdir(parents=True, exist_ok=True)
         video_path = args.record_dir / time.strftime("multi_live_%Y%m%d_%H%M%S.mp4")
@@ -433,6 +618,9 @@ def run_camera(args: argparse.Namespace) -> None:
             (args.process_width, args.process_height),
         )
         print(f"recording {video_path}")
+    if args.person_socket_output:
+        person_socket = PersonFrameSocketService(args.person_socket_host, args.person_socket_port, args.person_socket_history)
+        person_socket.start()
 
     while True:
         ok, frame = cap.read()
@@ -451,7 +639,7 @@ def run_camera(args: argparse.Namespace) -> None:
                 last_sample = live.calibrate(frame, args)
                 samples.append(last_sample)
                 if elapsed >= args.calibration_seconds and len(samples) >= args.min_calibration_frames:
-                    locked_cal = live.lock_calibration(samples, frame.shape)
+                    locked_cal = live.lock_calibration(samples, frame.shape, args)
                     state = "initializing_people"
                     person_init_start = now
                     person_init_valid = 0
@@ -492,6 +680,7 @@ def run_camera(args: argparse.Namespace) -> None:
         else:
             overlay, tracking = process_multi_frame(frame, locked_cal, people, args)
             status = f"tracking {tracking} fps={fps_smooth:.1f}"
+            publish_person_frame(frame_i, people, locked_cal, args, person_socket)
 
         cv2.putText(overlay, status, (18, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         if writer is not None:
@@ -524,12 +713,15 @@ def run_camera(args: argparse.Namespace) -> None:
     cap.release()
     if writer is not None:
         writer.release()
+    if person_socket is not None:
+        person_socket.close()
     preview.close()
 
 
 def default_args() -> argparse.Namespace:
     return argparse.Namespace(
         camera=0,
+        camera_device="",
         width=1920,
         height=1080,
         fps=30,
@@ -544,12 +736,26 @@ def default_args() -> argparse.Namespace:
         red_s_min=160,
         red_v_min=100,
         red_min_area=500,
+        red_cup_min_w=20,
+        red_cup_max_w=260,
+        red_cup_min_h=40,
+        red_cup_max_h=360,
+        red_cup_min_aspect=0.75,
         blue_h_min=108,
         blue_h_max=129,
         blue_s_min=145,
         blue_v_min=41,
         blue_min_area=150,
+        blue_cup_min_w=12,
+        blue_cup_max_w=320,
+        blue_cup_min_h=12,
+        blue_cup_max_h=300,
         blue_roi_top=0.25,
+        roi_enabled=False,
+        roi_x_min=0.0,
+        roi_x_max=1.0,
+        roi_y_min=0.0,
+        roi_y_max=1.0,
         front_blue_min_area=200,
         back_blue_min_area=50,
         front_min_dx=80.0,
@@ -563,9 +769,6 @@ def default_args() -> argparse.Namespace:
         show_calibration_mask=True,
         marker_merge_px=35,
         foot_split_offset_px=100.0,
-        head_z_min=0.35,
-        foot_z_max=0.25,
-        pair_max_distance=80.0,
         pair_max_px=450.0,
         track_max_jump=35.0,
         track_max_missing=10,
@@ -578,33 +781,73 @@ def default_args() -> argparse.Namespace:
         person_default_height=360.0,
         preview=True,
         max_frames=0,
+        person_frame_output=False,
+        person_frame_output_interval=1,
+        person_socket_output=True,
+        person_socket_host="127.0.0.1",
+        person_socket_port=8765,
+        person_socket_history=120,
         record_video=True,
-        record_dir=Path(__file__).resolve().parent / "recordings",
+        record_dir=PROJECT_ROOT / "recordings",
     )
 
 
-def parser_with_defaults() -> argparse.ArgumentParser:
-    defaults = default_args()
-    parser = argparse.ArgumentParser()
+def resolve_config_path(path: Path) -> Path:
+    path = path.expanduser()
+    return path if path.is_absolute() else app_config.PROJECT_ROOT / path
+
+
+def parser_with_defaults(defaults: argparse.Namespace | None = None, suppress_defaults: bool = False) -> argparse.ArgumentParser:
+    defaults = defaults or default_args()
+    default_value = argparse.SUPPRESS if suppress_defaults else app_config.DEFAULT_CONFIG_PATH
+    parser = argparse.ArgumentParser(argument_default=argparse.SUPPRESS if suppress_defaults else None)
+    parser.add_argument("--config", type=Path, default=default_value)
     for name, value in vars(defaults).items():
         option = "--" + name.replace("_", "-")
         if isinstance(value, bool):
-            parser.add_argument(option, dest=name, action="store_true", default=value)
-            parser.add_argument("--no-" + name.replace("_", "-"), dest=name, action="store_false")
+            parser.add_argument(option, dest=name, action="store_true", default=argparse.SUPPRESS if suppress_defaults else value)
+            parser.add_argument(
+                "--no-" + name.replace("_", "-"),
+                dest=name,
+                action="store_false",
+                default=argparse.SUPPRESS if suppress_defaults else value,
+            )
         elif isinstance(value, int):
-            parser.add_argument(option, type=int, default=value)
+            parser.add_argument(option, type=int, default=argparse.SUPPRESS if suppress_defaults else value)
         elif isinstance(value, float):
-            parser.add_argument(option, type=float, default=value)
+            parser.add_argument(option, type=float, default=argparse.SUPPRESS if suppress_defaults else value)
         elif isinstance(value, Path):
-            parser.add_argument(option, type=Path, default=value)
+            parser.add_argument(option, type=Path, default=argparse.SUPPRESS if suppress_defaults else value)
         else:
             choices = ["any", "dshow", "msmf"] if name == "backend" else None
-            parser.add_argument(option, default=value, choices=choices)
+            parser.add_argument(option, default=argparse.SUPPRESS if suppress_defaults else value, choices=choices)
     return parser
 
 
+def load_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
+    fallback = default_args()
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", type=Path, default=app_config.DEFAULT_CONFIG_PATH)
+    config_probe, _ = config_parser.parse_known_args(argv)
+    config_path = resolve_config_path(config_probe.config)
+
+    configured, messages = app_config.merge_config(fallback, config_path)
+    parser = parser_with_defaults(configured, suppress_defaults=True)
+    parsed = parser.parse_args(argv)
+
+    merged = vars(configured).copy()
+    cli_values = vars(parsed)
+    if "config" in cli_values:
+        config_path = resolve_config_path(cli_values.pop("config"))
+    merged.update(cli_values)
+    merged["config"] = config_path
+    return argparse.Namespace(**merged), messages
+
+
 def main() -> None:
-    args = parser_with_defaults().parse_args()
+    args, messages = load_args()
+    for message in messages:
+        print(message)
     run_camera(args)
 
 

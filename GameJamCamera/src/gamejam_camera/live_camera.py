@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import sys
 import time
 from pathlib import Path
 
+from . import camera_devices
+from . import space_preprocess as stable
 
-ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def import_runtime_packages():
-    deps = str(ROOT / ".deps")
+    deps = str(PROJECT_ROOT / ".deps")
     if Path(deps).exists():
         sys.path.insert(0, deps)
     try:
@@ -34,13 +35,6 @@ def import_runtime_packages():
 cv2, np = import_runtime_packages()
 
 
-STABLE_PATH = ROOT / "process_2487" / "stabilize_space_mask_preprocess.py"
-spec = importlib.util.spec_from_file_location("stable_preprocess", STABLE_PATH)
-stable = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(stable)
-
-
 def backend_value(name: str) -> int:
     return {
         "any": 0,
@@ -59,6 +53,55 @@ def hsv(frame: np.ndarray, use_clahe: bool) -> np.ndarray:
     if use_clahe:
         return stable.hsv(frame)
     return cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+
+def clamp01(value: object) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def roi_is_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "roi_enabled", False))
+
+
+def roi_bounds(args: argparse.Namespace) -> tuple[float, float, float, float]:
+    x1, x2 = sorted((clamp01(getattr(args, "roi_x_min", 0.0)), clamp01(getattr(args, "roi_x_max", 1.0))))
+    y1, y2 = sorted((clamp01(getattr(args, "roi_y_min", 0.0)), clamp01(getattr(args, "roi_y_max", 1.0))))
+    return x1, x2, y1, y2
+
+
+def roi_rect(shape: tuple[int, ...], args: argparse.Namespace) -> tuple[int, int, int, int] | None:
+    if not roi_is_enabled(args):
+        return None
+    height, width = shape[:2]
+    if height <= 0 or width <= 0:
+        return None
+    x_min, x_max, y_min, y_max = roi_bounds(args)
+    x1 = int(round(x_min * (width - 1)))
+    x2 = int(round(x_max * (width - 1)))
+    y1 = int(round(y_min * (height - 1)))
+    y2 = int(round(y_max * (height - 1)))
+    return x1, y1, max(x1, x2), max(y1, y2)
+
+
+def calibration_roi_mask(shape: tuple[int, ...], args: argparse.Namespace) -> np.ndarray:
+    height, width = shape[:2]
+    if not roi_is_enabled(args):
+        return np.full((height, width), 255, dtype=np.uint8)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    rect = roi_rect(shape, args)
+    if rect is None:
+        return mask
+    x1, y1, x2, y2 = rect
+    cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+    return mask
+
+
+def draw_roi_rect(frame: np.ndarray, rect: tuple[int, int, int, int] | None, label: str = "ROI") -> None:
+    if rect is None:
+        return
+    x1, y1, x2, y2 = rect
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 80), 2)
+    cv2.putText(frame, label, (x1 + 6, max(18, y1 + 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 80), 2)
 
 
 def red_blue_masks(
@@ -84,7 +127,7 @@ def red_blue_masks(
 
 
 def mask_view(frame: np.ndarray, args: argparse.Namespace, use_clahe: bool) -> np.ndarray:
-    full = np.full(frame.shape[:2], 255, dtype=np.uint8)
+    full = calibration_roi_mask(frame.shape, args)
     red, blue = red_blue_masks(
         frame,
         full,
@@ -122,11 +165,14 @@ def detect_red_cup(frame: np.ndarray, args: argparse.Namespace) -> dict[str, flo
     hh = hsv(frame, args.clahe)
     red = cv2.inRange(hh, np.array((0, args.red_s_min, args.red_v_min)), np.array((args.red_h1_max, 255, 255)))
     red |= cv2.inRange(hh, np.array((args.red_h2_min, args.red_s_min, args.red_v_min)), np.array((179, 255, 255)))
+    red = cv2.bitwise_and(red, calibration_roi_mask(frame.shape, args))
     blobs = stable.merge_close(stable.components(stable.clean(red), args.red_min_area), 28)
     blobs = [
         b
         for b in blobs
-        if 1 <= b["w"] <= 260 and 1 <= b["h"] <= 360 and b["h"] / max(b["w"], 1) >= 0.75
+        if args.red_cup_min_w <= b["w"] <= args.red_cup_max_w
+        and args.red_cup_min_h <= b["h"] <= args.red_cup_max_h
+        and b["h"] / max(b["w"], 1) >= args.red_cup_min_aspect
     ]
     if not blobs:
         raise RuntimeError("need red z cup, got 0")
@@ -140,9 +186,15 @@ def blue_candidates(frame: np.ndarray, args: argparse.Namespace) -> list[dict[st
         np.array((args.blue_h_min, args.blue_s_min, args.blue_v_min)),
         np.array((args.blue_h_max, 255, 255)),
     )
+    mask = cv2.bitwise_and(mask, calibration_roi_mask(frame.shape, args))
     mask[: int(frame.shape[0] * args.blue_roi_top), :] = 0
     blobs = stable.merge_close(stable.components(stable.clean(mask), args.blue_min_area), 28)
-    return [b for b in blobs if 12 <= b["w"] <= 320 and 12 <= b["h"] <= 300]
+    return [
+        b
+        for b in blobs
+        if args.blue_cup_min_w <= b["w"] <= args.blue_cup_max_w
+        and args.blue_cup_min_h <= b["h"] <= args.blue_cup_max_h
+    ]
 
 
 def detect_blue_cups(frame: np.ndarray, args: argparse.Namespace, z_ref: dict[str, float]) -> dict[str, dict[str, float]]:
@@ -196,7 +248,6 @@ def calibration_point(blob: dict[str, float]) -> dict[str, float]:
 
 
 def calibrate(frame: np.ndarray, args: argparse.Namespace) -> dict[str, object]:
-    # ponytail: red cup anchors front-left; fail instead of using background blue noise.
     z_ref = detect_red_cup(frame, args)
     blue = detect_blue_cups(frame, args, z_ref)
     polygon = np.array(
@@ -209,12 +260,14 @@ def calibrate(frame: np.ndarray, args: argparse.Namespace) -> dict[str, object]:
         dtype=np.int32,
     )
     detection_polygon = stable.space_polygon(blue, z_ref, frame.shape[1], frame.shape[0])
+    space = stable.make_space_mask(frame.shape[:2], detection_polygon)
     return {
         "blue": blue,
         "z_ref": z_ref,
         "polygon": polygon,
         "detection_polygon": detection_polygon,
-        "space": stable.make_space_mask(frame.shape[:2], detection_polygon),
+        "space": space,
+        "roi_rect": roi_rect(frame.shape, args),
         "xy_h": stable.xy_homography(blue),
         "axis_z": stable.z_axis(blue, z_ref),
     }
@@ -225,7 +278,11 @@ def median_blob(blobs: list[dict[str, float]]) -> dict[str, float]:
     return {key: float(np.median([float(blob[key]) for blob in blobs if key in blob])) for key in keys}
 
 
-def lock_calibration(samples: list[dict[str, object]], shape: tuple[int, int, int]) -> dict[str, object]:
+def lock_calibration(
+    samples: list[dict[str, object]],
+    shape: tuple[int, int, int],
+    args: argparse.Namespace | None = None,
+) -> dict[str, object]:
     blue = {
         name: median_blob([sample["blue"][name] for sample in samples])
         for name in ("front_left", "front_right", "back_left", "back_right")
@@ -241,12 +298,14 @@ def lock_calibration(samples: list[dict[str, object]], shape: tuple[int, int, in
         dtype=np.int32,
     )
     detection_polygon = stable.space_polygon(blue, z_ref, shape[1], shape[0])
+    space = stable.make_space_mask(shape[:2], detection_polygon)
     return {
         "blue": blue,
         "z_ref": z_ref,
         "polygon": xy_polygon,
         "detection_polygon": detection_polygon,
-        "space": stable.make_space_mask(shape[:2], detection_polygon),
+        "space": space,
+        "roi_rect": None,
         "xy_h": stable.xy_homography(blue),
         "axis_z": stable.z_axis(blue, z_ref),
         "samples": len(samples),
@@ -260,43 +319,11 @@ def red_mask(frame: np.ndarray, space: np.ndarray, args: argparse.Namespace, use
     return stable.clean(cv2.bitwise_and(red, space))
 
 
-def marker_row(blob: dict[str, float], role: str, cal: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
-    space_x, space_y = stable.map_xy(cal["xy_h"], blob["cx"], blob["cy"])
-    space_z = stable.map_z(cal["axis_z"], blob["cx"], blob["cy"]) / 100.0 * args.z_height
-    return {**blob, "role": role, "space_x": space_x, "space_y": space_y, "space_z": space_z}
-
-
-def process_tracking_frame(
-    frame: np.ndarray,
-    cal: dict[str, object],
-    args: argparse.Namespace,
-    use_clahe: bool,
-) -> tuple[np.ndarray, list[dict[str, object]], str]:
-    red = red_mask(frame, cal["space"], args, use_clahe)
-    candidates = []
-    for blob in stable.components(red, args.blob_min_area):
-        if np.hypot(blob["cx"] - cal["z_ref"]["cx"], blob["cy"] - cal["z_ref"]["cy"]) <= args.z_exclude_px:
-            continue
-        candidates.append(blob)
-
-    rows: list[dict[str, object]] = []
-    status = "missing_red"
-    if len(candidates) >= 2:
-        foot = max(candidates, key=lambda b: b["cy"])
-        head = min((b for b in candidates if b is not foot), key=lambda b: b["cy"])
-        rows = [marker_row(head, "head", cal, args), marker_row(foot, "foot", cal, args)]
-        status = "ok"
-    elif candidates:
-        rows = [marker_row(candidates[0], "candidate", cal, args)]
-        status = "partial"
-
-    return draw_tracking_overlay(frame, red, rows, cal), rows, status
-
-
 def draw_space_overlay(frame: np.ndarray, cal: dict[str, object]) -> np.ndarray:
     overlay = frame.copy()
     cv2.polylines(overlay, [cal["detection_polygon"]], True, (0, 180, 255), 1)
     cv2.polylines(overlay, [cal["polygon"]], True, (0, 255, 255), 2)
+    draw_roi_rect(overlay, cal.get("roi_rect"))
 
     blue_cups = cal["blue"]
     origin = (int(blue_cups["front_left"]["cx"]), int(blue_cups["front_left"]["cy"]))
@@ -312,27 +339,6 @@ def draw_space_overlay(frame: np.ndarray, cal: dict[str, object]) -> np.ndarray:
         p = (int(blob["cx"]), int(blob["cy"]))
         cv2.circle(overlay, p, 5, (255, 255, 255), -1)
         cv2.putText(overlay, name, (p[0] + 6, p[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    return overlay
-
-
-def draw_tracking_overlay(
-    frame: np.ndarray,
-    red: np.ndarray,
-    rows: list[dict[str, object]],
-    cal: dict[str, object],
-) -> np.ndarray:
-    overlay = draw_space_overlay(frame, cal)
-    overlay[red > 0] = (overlay[red > 0] * 0.35 + np.array((0, 0, 255)) * 0.65).astype(np.uint8)
-    for row in rows:
-        color = (255, 255, 255)
-        if row["role"] == "head":
-            color = (0, 0, 255)
-        elif row["role"] == "foot":
-            color = (0, 255, 255)
-        x, y, w, h = int(row["x"]), int(row["y"]), int(row["w"]), int(row["h"])
-        cv2.rectangle(overlay, (x, y), (x + w, y + h), color, 2)
-        label = f"{row['role']} x={row['space_x']:.1f} y={row['space_y']:.1f} z={row['space_z']:.2f}"
-        cv2.putText(overlay, label, (x, max(18, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
     return overlay
 
 
@@ -376,18 +382,21 @@ class Preview:
 
 
 def open_camera(args: argparse.Namespace) -> cv2.VideoCapture:
+    camera_index, device_message = camera_devices.resolve_camera_index(args)
+    if device_message:
+        print(device_message)
     tried = []
     cap = None
     for name in dict.fromkeys([args.backend, "any", "msmf", "dshow"]):
         backend = backend_value(name)
-        current = cv2.VideoCapture(args.camera, backend) if backend else cv2.VideoCapture(args.camera)
+        current = cv2.VideoCapture(camera_index, backend) if backend else cv2.VideoCapture(camera_index)
         tried.append(f"{name}:configured")
         if current.isOpened() and configure_and_probe(current, args, configure=True):
             cap = current
             print(f"camera_backend={name}")
             break
         current.release()
-        current = cv2.VideoCapture(args.camera, backend) if backend else cv2.VideoCapture(args.camera)
+        current = cv2.VideoCapture(camera_index, backend) if backend else cv2.VideoCapture(camera_index)
         tried.append(f"{name}:default")
         if current.isOpened() and configure_and_probe(current, args, configure=False):
             cap = current
@@ -395,7 +404,7 @@ def open_camera(args: argparse.Namespace) -> cv2.VideoCapture:
             break
         current.release()
     if cap is None:
-        raise SystemExit(f"cannot read camera {args.camera}; tried backends: {', '.join(tried)}")
+        raise SystemExit(f"cannot read camera {camera_index}; tried backends: {', '.join(tried)}")
     return cap
 
 
@@ -412,206 +421,3 @@ def configure_and_probe(cap: cv2.VideoCapture, args: argparse.Namespace, configu
             return True
         time.sleep(0.05)
     return False
-
-
-def scan_cameras(args: argparse.Namespace) -> None:
-    for camera in range(args.scan_cameras):
-        probe = argparse.Namespace(**vars(args))
-        probe.camera = camera
-        for name in dict.fromkeys([args.backend, "any", "msmf", "dshow"]):
-            backend = backend_value(name)
-            cap = cv2.VideoCapture(camera, backend) if backend else cv2.VideoCapture(camera)
-            ok = cap.isOpened() and configure_and_probe(cap, probe, configure=True)
-            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            actual_fps = cap.get(cv2.CAP_PROP_FPS)
-            cap.release()
-            if ok:
-                print(f"camera={camera} backend={name} actual={actual_w}x{actual_h}@{actual_fps:.1f}")
-                break
-        else:
-            print(f"camera={camera} unreadable")
-
-
-def run_camera(args: argparse.Namespace) -> None:
-    cap = open_camera(args)
-    preview = Preview()
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"camera={args.camera} actual={actual_w}x{actual_h}@{actual_fps:.1f}")
-    print(f"process={args.process_width}x{args.process_height} clahe={args.clahe}")
-    print("keys: c=recalibrate h=toggle CLAHE q/esc=quit")
-
-    locked_cal = None
-    last_sample = None
-    samples: list[dict[str, object]] = []
-    calibration_start = time.perf_counter()
-    use_clahe = args.clahe
-    fps_smooth = 0.0
-    last_status = time.perf_counter()
-    last = time.perf_counter()
-    frame_i = 0
-    rows: list[dict[str, object]] = []
-
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            print("camera read failed")
-            break
-        frame = resize_to(frame, args.process_width, args.process_height)
-
-        now = time.perf_counter()
-        dt = max(1e-6, now - last)
-        last = now
-        fps_smooth = (0.85 * fps_smooth + 0.15 / dt) if fps_smooth else 1.0 / dt
-        args.clahe = use_clahe
-
-        if locked_cal is None:
-            elapsed = now - calibration_start
-            try:
-                last_sample = calibrate(frame, args)
-                samples.append(last_sample)
-                if elapsed >= args.calibration_seconds and len(samples) >= args.min_calibration_frames:
-                    locked_cal = lock_calibration(samples, frame.shape)
-                    overlay = draw_space_overlay(frame, locked_cal)
-                    status = f"calibration locked samples={len(samples)} fps={fps_smooth:.1f} clahe={'on' if use_clahe else 'off'}"
-                    print(status)
-                else:
-                    overlay = draw_space_overlay(frame, last_sample)
-                    status = (
-                        f"calibrating valid={len(samples)}/required={args.min_calibration_frames} "
-                        f"t={elapsed:.1f}/{args.calibration_seconds:.1f}s fps={fps_smooth:.1f}"
-                    )
-            except Exception as exc:
-                overlay = draw_space_overlay(frame, last_sample) if last_sample else frame.copy()
-                status = (
-                    f"calibrating valid={len(samples)}/required={args.min_calibration_frames} "
-                    f"failed: {exc}"
-                )
-            if args.show_calibration_mask:
-                overlay = add_inset(overlay, mask_view(frame, args, use_clahe), "calibration mask")
-        else:
-            overlay, rows, tracking_status = process_tracking_frame(frame, locked_cal, args, use_clahe)
-            status = (
-                f"locked {tracking_status} markers={len(rows)} fps={fps_smooth:.1f} "
-                f"clahe={'on' if use_clahe else 'off'}"
-            )
-
-        cv2.putText(overlay, status, (18, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        key = preview.show(overlay)
-
-        if now - last_status >= 1.0:
-            print(f"frame={frame_i} {status}")
-            last_status = now
-        frame_i += 1
-
-        if key in ("Escape", "q"):
-            break
-        if key == "c":
-            locked_cal = None
-            last_sample = None
-            samples = []
-            calibration_start = time.perf_counter()
-            print("restarting calibration")
-        if key == "h":
-            use_clahe = not use_clahe
-            args.clahe = use_clahe
-            print(f"clahe={'on' if use_clahe else 'off'}")
-
-    cap.release()
-    preview.close()
-
-
-def benchmark(args: argparse.Namespace) -> None:
-    cap = cv2.VideoCapture(str(args.benchmark_video))
-    if not cap.isOpened():
-        raise SystemExit(f"cannot open video: {args.benchmark_video}")
-
-    frames = []
-    while len(frames) < args.benchmark_frames:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frames.append(resize_to(frame, args.process_width, args.process_height))
-    cap.release()
-    if not frames:
-        raise SystemExit("cannot read benchmark frames")
-
-    samples = []
-    for frame in frames:
-        try:
-            samples.append(calibrate(frame, args))
-        except RuntimeError:
-            pass
-    if len(samples) < args.min_calibration_frames:
-        raise SystemExit(
-            f"benchmark calibration failed: valid={len(samples)}/required={args.min_calibration_frames}"
-        )
-    cal = lock_calibration(samples, frames[0].shape)
-
-    blobs = 0
-    t0 = time.perf_counter()
-    for frame in frames:
-        _, rows, _ = process_tracking_frame(frame, cal, args, args.clahe)
-        blobs += len(rows)
-    dt = time.perf_counter() - t0
-    print("benchmark_note=preloaded_720p_processing_only")
-    print(f"benchmark_frames={len(frames)}")
-    print(f"benchmark_calibration_samples={len(samples)}")
-    print(f"benchmark_seconds={dt:.3f}")
-    print(f"benchmark_fps={len(frames) / dt:.1f}")
-    print(f"benchmark_blobs={blobs}")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--width", type=int, default=1920)
-    parser.add_argument("--height", type=int, default=1080)
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--process-width", type=int, default=1280)
-    parser.add_argument("--process-height", type=int, default=720)
-    parser.add_argument("--backend", default="dshow", choices=["any", "dshow", "msmf"])
-    parser.add_argument("--fourcc", default="MJPG")
-    parser.add_argument("--clahe", dest="clahe", action="store_true", default=True)
-    parser.add_argument("--no-clahe", dest="clahe", action="store_false")
-    parser.add_argument("--red-h1-max", type=int, default=12)
-    parser.add_argument("--red-h2-min", type=int, default=168)
-    parser.add_argument("--red-s-min", type=int, default=160)
-    parser.add_argument("--red-v-min", type=int, default=100)
-    parser.add_argument("--red-min-area", type=int, default=500)
-    parser.add_argument("--blue-h-min", type=int, default=108)
-    parser.add_argument("--blue-h-max", type=int, default=129)
-    parser.add_argument("--blue-s-min", type=int, default=145)
-    parser.add_argument("--blue-v-min", type=int, default=41)
-    parser.add_argument("--blue-min-area", type=int, default=150)
-    parser.add_argument("--blue-roi-top", type=float, default=0.25)
-    parser.add_argument("--front-blue-min-area", type=int, default=800)
-    parser.add_argument("--back-blue-min-area", type=int, default=250)
-    parser.add_argument("--front-min-dx", type=float, default=80.0)
-    parser.add_argument("--back-x-margin", type=float, default=20.0)
-    parser.add_argument("--back-y-gap", type=float, default=15.0)
-    parser.add_argument("--blob-min-area", type=int, default=60)
-    parser.add_argument("--calibration-seconds", type=float, default=10.0)
-    parser.add_argument("--min-calibration-frames", type=int, default=30)
-    parser.add_argument("--z-exclude-px", type=float, default=80.0)
-    parser.add_argument("--z-height", type=float, default=1.0)
-    parser.add_argument("--show-calibration-mask", dest="show_calibration_mask", action="store_true", default=True)
-    parser.add_argument("--hide-calibration-mask", dest="show_calibration_mask", action="store_false")
-    parser.add_argument("--benchmark-video", type=Path)
-    parser.add_argument("--benchmark-frames", type=int, default=180)
-    parser.add_argument("--scan-cameras", type=int, default=0)
-    parser.add_argument("--camera-warmup-reads", type=int, default=40)
-    args = parser.parse_args()
-
-    if args.scan_cameras:
-        scan_cameras(args)
-    elif args.benchmark_video:
-        benchmark(args)
-    else:
-        run_camera(args)
-
-
-if __name__ == "__main__":
-    main()

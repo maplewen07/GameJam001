@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -6,10 +8,30 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / ".deps"))
 
-import cv2
-import numpy as np
+
+def import_runtime_packages():
+    deps = str(ROOT / ".deps")
+    if Path(deps).exists():
+        sys.path.insert(0, deps)
+    try:
+        import cv2 as cv2_module
+        import numpy as np_module
+        return cv2_module, np_module
+    except Exception:
+        for name in list(sys.modules):
+            if name == "cv2" or name.startswith("cv2.") or name == "numpy" or name.startswith("numpy."):
+                del sys.modules[name]
+        try:
+            sys.path.remove(deps)
+        except ValueError:
+            pass
+        import cv2 as cv2_module
+        import numpy as np_module
+        return cv2_module, np_module
+
+
+cv2, np = import_runtime_packages()
 
 
 VIDEO_PATH = Path(r"F:\Github\GameJam\IMG_2487.MOV")
