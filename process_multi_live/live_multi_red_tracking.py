@@ -42,7 +42,7 @@ def red_candidates(frame: np.ndarray, cal: dict[str, object], args: argparse.Nam
 def foot_split_y(cal: dict[str, object], args: argparse.Namespace) -> float:
     blue = cal["blue"]
     back_y = (float(blue["back_left"]["cy"]) + float(blue["back_right"]["cy"])) * 0.5
-    return back_y - float(args.foot_split_offset_px)
+    return back_y + float(args.foot_split_offset_px)
 
 
 def split_markers(markers: list[dict[str, object]], split_y: float) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
